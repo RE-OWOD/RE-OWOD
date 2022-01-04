@@ -1,0 +1,18 @@
+_BASE_: "../../Base-RCNN-C4-OWOD.yaml"
+MODEL:
+  WEIGHTS: "/home/fk1/workspace/OWOD/output/t4_ft/model_final.pth"
+DATASETS:
+  TRAIN: ('t4_voc_coco_2007_ft', )
+  TEST: ('voc_coco_2007_test', )
+SOLVER:
+  STEPS: (227500, 228500)
+  MAX_ITER: 232500
+  WARMUP_ITERS: 0
+OUTPUT_DIR: "./output/t4_ft"
+OWOD:
+  PREV_INTRODUCED_CLS: 60
+  CUR_INTRODUCED_CLS: 20
+  ENABLE_CLUSTERING: False
+  ENABLE_THRESHOLD_AUTOLABEL_UNK: False
+  CLUSTERING:
+    START_ITER: 188500

@@ -1,0 +1,14 @@
+_BASE_: "../../Base-RCNN-C4-OWOD.yaml"
+MODEL:
+  WEIGHTS: "/home/joseph/workspace/OWOD/output/t4_ft/model_final.pth"
+  ROI_HEADS:
+    NMS_THRESH_TEST: 0.4
+TEST:
+  DETECTIONS_PER_IMAGE: 100
+DATASETS:
+  TRAIN: ('t3_voc_coco_2007_train', )
+  TEST: ('voc_coco_2007_test', )
+OUTPUT_DIR: "./output/t4_evalulate"
+OWOD:
+  PREV_INTRODUCED_CLS: 60
+  CUR_INTRODUCED_CLS: 20
