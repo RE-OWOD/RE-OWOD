@@ -10,7 +10,7 @@ Our new data division is based on COCO2017. We divide the training set into four
 For the testing set, we adopt the validation set of COCO2017, which contains relatively complete annotation information.
 
 The data files are at [./datasets/Main/](./datasets/Main/).
-And the codes for creating these files are at [datasets/coco_utils](datasets/coco_utils)
+<!-- And the codes for creating these files are at [datasets/coco_utils](datasets/coco_utils) -->
 
 
 <!-- 
