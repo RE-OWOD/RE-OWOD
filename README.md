@@ -1,6 +1,6 @@
 <!-- ### Hi there 👋 -->
 
-# Revisting Open World Object Detection
+# Revisiting Open World Object Detection
 
 ## Installation
 See [INSTALL.md](INSTALL.md).
