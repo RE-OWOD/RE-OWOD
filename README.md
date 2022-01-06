@@ -1,6 +1,6 @@
 <!-- ### Hi there 👋 -->
 
-# Revisiting Open World Object Detection
+# Revisiting Open World Object Detection [[arXiv]](https://arxiv.org/abs/2201.00471)
 
 ## Installation
 See [INSTALL.md](INSTALL.md).
