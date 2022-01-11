@@ -1,18 +1,15 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import logging
 from typing import Dict, Union
-
-import numpy as np
 import torch
 import os
 import math
 import shortuuid
-import time
-import pickle
 from fvcore.nn import giou_loss, smooth_l1_loss
 from torch import nn
 from torch.nn import functional as F
 from torch.distributions.normal import Normal
+import sys
 
 import detectron2.utils.comm as comm
 from detectron2.config import configurable
@@ -53,10 +50,7 @@ Naming convention:
 """
 
 
-
-def fast_rcnn_inference(
-    boxes, scores, image_shapes, predictions, score_thresh, nms_thresh, topk_per_image, calibration, unk_thresh
-):
+def fast_rcnn_inference(boxes, scores, image_shapes, predictions, score_thresh, nms_thresh, topk_per_image):
     """
     Call `fast_rcnn_inference_single_image` for all images.
 
@@ -84,7 +78,7 @@ def fast_rcnn_inference(
     """
     result_per_image = [
         fast_rcnn_inference_single_image(
-            boxes_per_image, scores_per_image, image_shape, score_thresh, nms_thresh, topk_per_image, prediction, calibration, unk_thresh
+            boxes_per_image, scores_per_image, image_shape, score_thresh, nms_thresh, topk_per_image, prediction
         )
         for scores_per_image, boxes_per_image, image_shape, prediction in zip(scores, boxes, image_shapes, predictions)
     ]
@@ -92,7 +86,7 @@ def fast_rcnn_inference(
 
 
 def fast_rcnn_inference_single_image(
-    boxes, scores, image_shape, score_thresh, nms_thresh, topk_per_image, prediction, calibration, unk_thresh
+    boxes, scores, image_shape, score_thresh, nms_thresh, topk_per_image, prediction,calibration, unk_thresh
 ):
     """
     Single-image inference. Return bounding-box detection results by thresholding
@@ -105,7 +99,7 @@ def fast_rcnn_inference_single_image(
     Returns:
         Same as `fast_rcnn_inference`, but for only one image.
     """
-    # loading calibration's pickle file
+    
     if calibration>0:
         pickle_addr = "/home/wangduorui/OWOD-zxw/analyze/1122/t2_ori_set_train_scores_cali_0" + str(10 * calibration) + ".pickle"
         with open(pickle_addr, "rb") as file:
@@ -123,7 +117,7 @@ def fast_rcnn_inference_single_image(
             class_list.append(torch.mean(per_class))
             # var
             class_var_list.append((torch.sqrt(torch.var(per_class))) / (np.sqrt(class_num)))
-
+    
     logits = prediction
     valid_mask = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores).all(dim=1)
     if not valid_mask.all():
@@ -159,30 +153,10 @@ def fast_rcnn_inference_single_image(
     boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
     logits = logits[keep]
 
-    # calibration for unknown
-    if calibration>0:
-        if len(filter_inds[:, 1]) > 0:
-            score_back = F.softmax(logits, dim=-1)
-            # TODO: check difference between score_back(multi) and scores(1)
-
-            new_pred_classes = filter_inds[:, 1]
-            for pred_i in range(len(score_back)):
-                c = 0
-                for i in range(20):
-                    if score_back[pred_i, i] < class_list[i] * unk_thresh:
-                        # if score_back[pred_i, i] < (class_list[i] - var_times * class_var_list[i]) * unk_thresh:
-                        c += 1
-                        logits[pred_i, i] = 0
-                if c == 20:
-                    new_pred_classes[pred_i] = 80
-        else:
-            new_pred_classes = filter_inds[:, 1]
-
     result = Instances(image_shape)
     result.pred_boxes = Boxes(boxes)
     result.scores = scores
-    # result.pred_classes = filter_inds[:, 1]
-    result.pred_classes = new_pred_classes
+    result.pred_classes = filter_inds[:, 1]
     result.logits = logits
     return result, filter_inds[:, 0]
 
@@ -290,11 +264,9 @@ class FastRCNNOutputs:
             self._log_accuracy()
             self.pred_class_logits[:, self.invalid_class_range] = -10e10
             # self.log_logits(self.pred_class_logits, self.gt_classes)
-
-            mean_loss = softmax_loss(self.pred_class_logits, self.gt_classes)
-            return mean_loss
-
-            # return F.cross_entropy(self.pred_class_logits, self.gt_classes, reduction="mean")
+            # print("self.gt_classes:",self.gt_classes)
+            # sys.exit()
+            return F.cross_entropy(self.pred_class_logits, self.gt_classes, reduction="mean")
 
     def log_logits(self, logits, cls):
         data = (logits, cls)
@@ -323,7 +295,7 @@ class FastRCNNOutputs:
         # Empty fg_inds produces a valid loss of zero as long as the size_average
         # arg to smooth_l1_loss is False (otherwise it uses torch.mean internally
         # and would produce a nan loss).
-        fg_inds = nonzero_tuple((self.gt_classes >= 0) & (self.gt_classes < bg_class_ind))[0]
+        fg_inds = nonzero_tuple((self.gt_classes >= 0) & (self.gt_classes < bg_class_ind))[0] # -1 不算unk的loss
         if cls_agnostic_bbox_reg:
             # pred_proposal_deltas only corresponds to foreground class for agnostic
             gt_class_cols = torch.arange(box_dim, device=device)
@@ -470,8 +442,6 @@ class FastRCNNOutputLayers(nn.Module):
         output_dir,
         feat_store_path,
         margin,
-        calibration,
-        unk_thresh,
         num_classes: int,
         test_score_thresh: float = 0.0,
         test_nms_thresh: float = 0.5,
@@ -554,28 +524,6 @@ class FastRCNNOutputLayers(nn.Module):
             self.feature_store = Store(num_classes + 1, clustering_items_per_class)
         self.means = [None for _ in range(num_classes + 1)]
         self.margin = margin
-        # post treatment para
-        self.calibration = calibration
-        self.unk_thresh = unk_thresh
-
-        # self.feat_store_path1 = "./output/1129_train/t1/feature_store/feat.pt"
-        # data = torch.load(self.feat_store_path1)
-        # items=data.retrieve(-1)
-        # for index, item in enumerate(items):
-        #     if len(item) == 0:
-        #         self.means[index] = None
-        #     else:
-        #         mu = torch.tensor(item).mean(dim=0)
-        #         self.means[index] = mu
-        # self.all_means1 = self.means
-        # for item in self.all_means1:
-        #     if item != None:
-        #         length = item.shape
-        #         break
-        
-        # for i, item in enumerate(self.all_means1):
-        #     if item == None:
-        #         self.all_means1[i] = torch.zeros((length))
 
         # self.ae_model = AE(input_size, clustering_z_dimension)
         # self.ae_model.apply(Xavier)
@@ -606,8 +554,6 @@ class FastRCNNOutputLayers(nn.Module):
             "output_dir"            : cfg.OUTPUT_DIR,
             "feat_store_path"       : cfg.OWOD.FEATURE_STORE_SAVE_PATH,
             "margin"                : cfg.OWOD.CLUSTERING.MARGIN,
-            "calibration"           : cfg.OWOD.CLUSTERING.CLIBARATION,
-            "unk_thresh"             : cfg.OWOD.CLUSTERING.UNK_THRESH,
             # fmt: on
         }
 
@@ -626,30 +572,9 @@ class FastRCNNOutputLayers(nn.Module):
         """
         if x.dim() > 2:
             x = torch.flatten(x, start_dim=1)
-        # scores = self.cls_score(x)
-
-        all_means = self.means
-        for item in all_means:
-            if item != None:
-                length = item.shape
-                break
-
-        for i, item in enumerate(all_means):
-            if item == None:
-                all_means[i] = torch.zeros((length))
-        # dist = Distance(x, all_means)
-        # scores = -dist / 0.1
-        scores = self.solve(x, torch.stack(all_means).cuda())
-
+        scores = self.cls_score(x)
         proposal_deltas = self.bbox_pred(x)
         return scores, proposal_deltas
-
-    def solve(self,features, means):
-        features = features.unsqueeze(1)
-        means = means.unsqueeze(0)
-        prob = torch.exp(-torch.norm(features - means, dim=-1))
-        prob = prob / prob.sum(-1, keepdim=True)
-        return prob
 
     def update_feature_store(self, features, proposals):
         # cat(..., dim=0) concatenates over all images in the batch
@@ -662,41 +587,9 @@ class FastRCNNOutputLayers(nn.Module):
             logging.getLogger(__name__).info('Saving image store at iteration ' + str(storage.iter) + ' to ' + self.feature_store_save_loc)
             torch.save(self.feature_store, self.feature_store_save_loc)
             self.feature_store_is_stored = True
-            # print("11111111111111111111111111111111111")
 
         # self.feature_store.add(F.normalize(features, dim=0), gt_classes)
         # self.feature_store.add(self.ae_model.encoder(features), gt_classes)
-
-
-    def updatePrototype(self):
-        storage = get_event_storage()
-        if storage.iter == self.clustering_start_iter:
-            items = self.feature_store.retrieve(-1)
-            for index, item in enumerate(items):
-                if len(item) == 0:
-                    self.means[index] = None
-                else:
-                    mu = torch.tensor(item).mean(dim=0)
-                    self.means[index] = mu
-            # Freeze the parameters when clustering starts
-            # for param in self.ae_model.parameters():
-            #     param.requires_grad = False
-        elif storage.iter > self.clustering_start_iter:
-            if storage.iter % self.clustering_update_mu_iter == 0:
-                # Compute new MUs
-                items = self.feature_store.retrieve(-1)
-                new_means = [None for _ in range(self.num_classes + 1)]
-                for index, item in enumerate(items):
-                    if len(item) == 0:
-                        new_means[index] = None
-                    else:
-                        new_means[index] = torch.tensor(item).mean(dim=0)
-                # Update the MUs
-                for i, mean in enumerate(self.means):
-                    if(mean) is not None and new_means[i] is not None:
-                        self.means[i] = self.clustering_momentum * mean + \
-                                        (1 - self.clustering_momentum) * new_means[i]
-        return self.means
 
 
     def clstr_loss_l2_cdist(self, input_features, proposals):
@@ -716,19 +609,17 @@ class FastRCNNOutputLayers(nn.Module):
         # fg_features = F.normalize(fg_features, dim=0)
         # fg_features = self.ae_model.encoder(fg_features)
 
-
-
-        self.all_means = self.means
-        for item in self.all_means:
+        all_means = self.means
+        for item in all_means:
             if item != None:
                 length = item.shape
                 break
 
-        for i, item in enumerate(self.all_means):
+        for i, item in enumerate(all_means):
             if item == None:
-                self.all_means[i] = torch.zeros((length))
+                all_means[i] = torch.zeros((length))
 
-        distances = torch.cdist(fg_features, torch.stack(self.all_means).cuda(), p=self.margin)
+        distances = torch.cdist(fg_features, torch.stack(all_means).cuda(), p=self.margin)
         labels = []
 
         for index, feature in enumerate(fg_features):
@@ -751,36 +642,35 @@ class FastRCNNOutputLayers(nn.Module):
 
         storage = get_event_storage()
         c_loss = 0
-        # self.means=all_means
-        # if storage.iter == self.clustering_start_iter:
-        #     items = self.feature_store.retrieve(-1)
-        #     for index, item in enumerate(items):
-        #         if len(item) == 0:
-        #             self.means[index] = None
-        #         else:
-        #             mu = torch.tensor(item).mean(dim=0)
-        #             self.means[index] = mu
-        #     c_loss = self.clstr_loss_l2_cdist(input_features, proposals)
-        #     # Freeze the parameters when clustering starts
-        #     # for param in self.ae_model.parameters():
-        #     #     param.requires_grad = False
-        # elif storage.iter > self.clustering_start_iter:
-        #     if storage.iter % self.clustering_update_mu_iter == 0:
-        #         # Compute new MUs
-        #         items = self.feature_store.retrieve(-1)
-        #         new_means = [None for _ in range(self.num_classes + 1)]
-        #         for index, item in enumerate(items):
-        #             if len(item) == 0:
-        #                 new_means[index] = None
-        #             else:
-        #                 new_means[index] = torch.tensor(item).mean(dim=0)
-        #         # Update the MUs
-        #         for i, mean in enumerate(self.means):
-        #             if(mean) is not None and new_means[i] is not None:
-        #                 self.means[i] = self.clustering_momentum * mean + \
-        #                                 (1 - self.clustering_momentum) * new_means[i]
+        if storage.iter == self.clustering_start_iter:
+            items = self.feature_store.retrieve(-1)
+            for index, item in enumerate(items):
+                if len(item) == 0:
+                    self.means[index] = None
+                else:
+                    mu = torch.tensor(item).mean(dim=0)
+                    self.means[index] = mu
+            c_loss = self.clstr_loss_l2_cdist(input_features, proposals)
+            # Freeze the parameters when clustering starts
+            # for param in self.ae_model.parameters():
+            #     param.requires_grad = False
+        elif storage.iter > self.clustering_start_iter:
+            if storage.iter % self.clustering_update_mu_iter == 0:
+                # Compute new MUs
+                items = self.feature_store.retrieve(-1)
+                new_means = [None for _ in range(self.num_classes + 1)]
+                for index, item in enumerate(items):
+                    if len(item) == 0:
+                        new_means[index] = None
+                    else:
+                        new_means[index] = torch.tensor(item).mean(dim=0)
+                # Update the MUs
+                for i, mean in enumerate(self.means):
+                    if(mean) is not None and new_means[i] is not None:
+                        self.means[i] = self.clustering_momentum * mean + \
+                                        (1 - self.clustering_momentum) * new_means[i]
 
-        c_loss = self.clstr_loss_l2_cdist(input_features, proposals)
+            c_loss = self.clstr_loss_l2_cdist(input_features, proposals)
         return c_loss
 
     # def get_ae_loss(self, input_features):
@@ -840,8 +730,6 @@ class FastRCNNOutputLayers(nn.Module):
             self.test_score_thresh,
             self.test_nms_thresh,
             self.test_topk_per_image,
-            self.calibration,
-            self.unk_thresh,
         )
 
     def predict_boxes_for_gt_classes(self, predictions, proposals):
@@ -920,103 +808,3 @@ class FastRCNNOutputLayers(nn.Module):
         num_inst_per_image = [len(p) for p in proposals]
         probs = F.softmax(scores, dim=-1)
         return probs.split(num_inst_per_image, dim=0)
-
-    # def clstr_loss(self, input_features, proposals):
-    #     """
-    #     Get the foreground input_features, generate distributions for the class,
-    #     get probability of each feature from each distribution;
-    #     Compute loss: if belonging to a class -> likelihood should be higher
-    #                   else -> lower
-    #     :param input_features:
-    #     :param proposals:
-    #     :return:
-    #     """
-    #     loss = 0
-    #     gt_classes = torch.cat([p.gt_classes for p in proposals])
-    #     mask = gt_classes != self.num_classes
-    #     fg_features = input_features[mask]
-    #     classes = gt_classes[mask]
-    #     # fg_features = self.ae_model.encoder(fg_features)
-    #
-    #     # Distribution per class
-    #     log_prob = [None for _ in range(self.num_classes + 1)]
-    #     # https://github.com/pytorch/pytorch/issues/23780
-    #     for cls_index, mu in enumerate(self.means):
-    #         if mu is not None:
-    #             dist = Normal(loc=mu.cuda(), scale=torch.ones_like(mu.cuda()))
-    #             log_prob[cls_index] = dist.log_prob(fg_features).mean(dim=1)
-    #             # log_prob[cls_index] = torch.distributions.multivariate_normal. \
-    #             #     MultivariateNormal(mu.cuda(), torch.eye(len(mu)).cuda()).log_prob(fg_features)
-    #                 # MultivariateNormal(mu, torch.eye(len(mu))).log_prob(fg_features.cpu())
-    #             #                     MultivariateNormal(mu[:2], torch.eye(len(mu[:2]))).log_prob(fg_features[:,:2].cpu())
-    #         else:
-    #             log_prob[cls_index] = torch.zeros((len(fg_features))).cuda()
-    #
-    #     log_prob = torch.stack(log_prob).T # num_of_fg_proposals x num_of_classes
-    #     for i, p in enumerate(log_prob):
-    #         weight = torch.ones_like(p) * -1
-    #         weight[classes[i]] = 1
-    #         p = p * weight
-    #         loss += p.mean()
-    #     return loss
-
-    # def clstr_loss_l2(self, input_features, proposals):
-    #     """
-    #     Get the foreground input_features, generate distributions for the class,
-    #     get probability of each feature from each distribution;
-    #     Compute loss: if belonging to a class -> likelihood should be higher
-    #                   else -> lower
-    #     :param input_features:
-    #     :param proposals:
-    #     :return:
-    #     """
-    #     loss = 0
-    #     gt_classes = torch.cat([p.gt_classes for p in proposals])
-    #     mask = gt_classes != self.num_classes
-    #     fg_features = input_features[mask]
-    #     classes = gt_classes[mask]
-    #     fg_features = self.ae_model.encoder(fg_features)
-    #
-    #     for index, feature in enumerate(fg_features):
-    #         for cls_index, mu in enumerate(self.means):
-    #             if mu is not None and feature is not None:
-    #                 mu = mu.cuda()
-    #                 if  classes[index] ==  cls_index:
-    #                     loss -= F.mse_loss(feature, mu)
-    #                 else:
-    #                     loss += F.mse_loss(feature, mu)
-    #
-    #     return loss
-
-def Distance(features, centers):
-    f_2 = torch.sum(torch.pow(features, 2), dim=1, keep_dims=True,)
-    c_2 = torch.sum(torch.pow(centers, 2), dim=1, keep_dims=True)
-    dist = f_2 - 2 * torch.matmul(features, centers) + torch.transpose(c_2, 1, 0)
-
-    return dist
-
-def softmax_loss(logits, labels):
-    # labels = tf.to_int32(labels)
-
-    logp = torch.nn.functional.log_softmax(logits)
-    labels=labels.reshape(-1,1)
-    logpy = torch.gather(logp, 1, labels)
-    loss = -(logpy).mean()
-    # print("loss",loss)
-
-        # cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels,
-        #                                                                logits=logits, name='xentropy')
-    return loss*0.1
-
-
-
-    #   def softmax_loss(self,logits, labels):
-    #     # labels = tf.to_int32(labels)
-
-    #     logp = torch.nn.functional.log_softmax(logits)
-    #     # print(logp.shape)
-    #     # print(labels.shape)
-    #     # sys.exit()
-    #     labels=labels.reshape(-1,1)
-    #     logpy = torch.gather(logp, 1, labels)
-    #     loss = -(logpy).mean()

@@ -6,11 +6,12 @@ import heapq
 import os
 import shortuuid
 import operator
-import shortuuid
+import sys
+import cv2
 from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
-import time
+# from ..drawBoxes import draw_boxes
 
 from detectron2.config import configurable
 from detectron2.layers import ShapeSpec, nonzero_tuple
@@ -149,6 +150,7 @@ class ROIHeads(torch.nn.Module):
         batch_size_per_image,
         positive_fraction,
         proposal_matcher,
+        proposal_matcher_unk,
         enable_thresold_autolabelling,
         unk_k,
         proposal_append_gt=True,
@@ -169,6 +171,7 @@ class ROIHeads(torch.nn.Module):
         self.positive_fraction = positive_fraction
         self.num_classes = num_classes
         self.proposal_matcher = proposal_matcher
+        self.proposal_matcher_unk = proposal_matcher_unk
         self.proposal_append_gt = proposal_append_gt
         self.enable_thresold_autolabelling = enable_thresold_autolabelling
         self.unk_k = unk_k
@@ -183,6 +186,12 @@ class ROIHeads(torch.nn.Module):
             # Matcher to assign box proposals to gt boxes
             "proposal_matcher": Matcher(
                 cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS,
+                cfg.MODEL.ROI_HEADS.IOU_LABELS,
+                allow_low_quality_matches=False,
+            ),
+            "proposal_matcher_unk": Matcher(
+                # cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS_UNK,
+                [0.8],
                 cfg.MODEL.ROI_HEADS.IOU_LABELS,
                 allow_low_quality_matches=False,
             ),
@@ -229,24 +238,11 @@ class ROIHeads(torch.nn.Module):
         sampled_idxs = torch.cat([sampled_fg_idxs, sampled_bg_idxs], dim=0)
         gt_classes_ss = gt_classes[sampled_idxs]
 
-        if self.enable_thresold_autolabelling:
-            matched_labels_ss = matched_labels[sampled_idxs]
-            pred_objectness_score_ss = objectness_logits[sampled_idxs]
-
-            # 1) Remove FG objectness score. 2) Sort and select top k. 3) Build and apply mask.
-            mask = torch.zeros((pred_objectness_score_ss.shape), dtype=torch.bool)
-            pred_objectness_score_ss[matched_labels_ss != 0] = -1
-            sorted_indices = list(zip(
-                *heapq.nlargest(self.unk_k, enumerate(pred_objectness_score_ss), key=operator.itemgetter(1))))[0]
-            for index in sorted_indices:
-                mask[index] = True
-            gt_classes_ss[mask] = self.num_classes - 1
-
         return sampled_idxs, gt_classes_ss
 
     @torch.no_grad()
     def label_and_sample_proposals(
-        self, proposals: List[Instances], targets: List[Instances]
+        self, proposals: List[Instances], targets: List[Instances], image_id = None, ori_image = None
     ) -> List[Instances]:
         """
         Prepare some proposals to be used to train the ROI heads.
@@ -287,10 +283,13 @@ class ROIHeads(torch.nn.Module):
             proposals = add_ground_truth_to_proposals(gt_boxes, proposals)
 
         proposals_with_gt = []
+        unk_sel_gt = []
 
         num_fg_samples = []
         num_bg_samples = []
-        for proposals_per_image, targets_per_image in zip(proposals, targets):
+        for proposals_per_image, targets_per_image,image_id_i,ori_image_i\
+             in zip(proposals, targets, image_id, ori_image):
+            height_new, width_new = proposals_per_image.image_size
             has_gt = len(targets_per_image) > 0
             match_quality_matrix = pairwise_iou(
                 targets_per_image.gt_boxes, proposals_per_image.proposal_boxes
@@ -299,6 +298,89 @@ class ROIHeads(torch.nn.Module):
             sampled_idxs, gt_classes = self._sample_proposals(
                 matched_idxs, matched_labels, targets_per_image.gt_classes, proposals_per_image.objectness_logits
             )
+            del match_quality_matrix
+            gt_flag = False
+            unk_flag = False
+            storage = get_event_storage()
+            if self.enable_thresold_autolabelling and storage.iter > 50000:
+                matched_labels_ss = matched_labels[sampled_idxs]
+                pred_objectness_score_ss = proposals_per_image.objectness_logits[sampled_idxs]
+
+                pred_objectness_score_ss[matched_labels_ss != 0] = -1
+                sorted_indices = list(zip(
+                    *heapq.nlargest(50, enumerate(pred_objectness_score_ss), key=operator.itemgetter(1))))[0]
+                mask = torch.zeros((pred_objectness_score_ss.shape), dtype=torch.bool)
+                
+                new_flag = True
+                for index in sorted_indices:
+                    if new_flag:
+                        auotolabel_boxes = proposals_per_image.proposal_boxes[sampled_idxs[index].item()]
+                        autolabel_score = proposals_per_image.objectness_logits[sampled_idxs[index].item()].view(1,-1)
+                        new_flag = False
+                    else:
+                        box_i = proposals_per_image.proposal_boxes[sampled_idxs[index].item()]
+                        score_i = proposals_per_image.objectness_logits[sampled_idxs[index].item()].view(1,-1)
+                        auotolabel_boxes = Boxes.cat([auotolabel_boxes, box_i])
+                        autolabel_score = torch.cat([autolabel_score,score_i],1)
+
+                obj_save_path = "../score_store/" + image_id_i + ".jpg"+".pickle"
+                obj_score_save = torch.load(obj_save_path)
+                height_ori, width_ori = obj_score_save['image_size']
+                obj_score_boxes = obj_score_save['obj_boxes']
+                
+                if len(obj_score_boxes):
+                    obj_boxes_sel = obj_score_boxes[:50,:4]
+                    obj_boxes_sel[:,0] = obj_boxes_sel[:,0] * (width_new * 1.0 / width_ori)
+                    obj_boxes_sel[:,1] = obj_boxes_sel[:,1] * (height_new * 1.0 / height_ori)
+                    obj_boxes_sel[:,2] = obj_boxes_sel[:,2] * (width_new * 1.0 / width_ori)
+                    obj_boxes_sel[:,3] = obj_boxes_sel[:,3] * (height_new * 1.0 / height_ori)
+                    obj_boxes = Boxes(torch.Tensor(obj_boxes_sel).cuda())
+                    
+                    area_new = width_new * height_new
+                    area_mask = obj_boxes.area() / area_new
+                    area_mask = area_mask < 0.8
+
+                    unk_match_matrix = pairwise_iou(obj_boxes, auotolabel_boxes)
+                    unk_match_matrix[unk_match_matrix < 0.9] = 0 # 0.7
+                    score_matrix = torch.mm(area_mask.view(-1,1).float(),autolabel_score.view(1,-1))
+                    score_matrix = torch.mul(score_matrix, unk_match_matrix)
+                    score_matrix, _ = torch.max(score_matrix, 0)
+                    _, unk_max_index = torch.max(score_matrix, 0)
+                    unk_obj_index = torch.nonzero(score_matrix).cpu()
+                    del unk_match_matrix
+                    if len(unk_obj_index): # pseudo
+                        gt_flag = True
+                        unk_instances_gt = Instances(proposals_per_image.image_size)
+                        unk_box = auotolabel_boxes[unk_max_index.item()]
+                        unk_instances_gt.gt_boxes = unk_box
+                        unk_instances_gt.gt_classes = torch.Tensor([80]).long().cuda()
+                        targets_per_image = Instances.cat([targets_per_image, unk_instances_gt])
+                                                
+                        match_quality_matrix = pairwise_iou(
+                            unk_instances_gt.gt_boxes, proposals_per_image.proposal_boxes[sampled_idxs]
+                        )
+                        _, matched_labels_unk = self.proposal_matcher_unk(match_quality_matrix)
+                        del match_quality_matrix
+                        matched_unk_mask = matched_labels_unk == 1
+                        matched_unk_mask_idx = torch.nonzero(matched_unk_mask)
+                        for index in matched_unk_mask_idx:
+                            if sampled_idxs[index] < 100:
+                                mask[index] = True
+
+                    unk_match_matrix = pairwise_iou(obj_boxes, auotolabel_boxes)
+                    unk_match_matrix[unk_match_matrix < 0.7] = 0
+
+                    score_matrix = torch.mm(area_mask.view(-1,1).float(),autolabel_score.view(1,-1))
+                    score_matrix = torch.mul(score_matrix, unk_match_matrix)
+                    score_matrix,_ = torch.max(score_matrix, 0)
+                    del unk_match_matrix
+                    unk_obj_index = torch.nonzero(score_matrix).cpu()
+                    score_matrix = score_matrix[score_matrix > 0]
+
+                    if len(unk_obj_index):
+                        for idx in unk_obj_index:
+                            mask[sorted_indices[idx]] = True
+                    gt_classes[mask] = 80
 
             # Set target attributes of the sampled proposals:
             proposals_per_image = proposals_per_image[sampled_idxs]
@@ -323,14 +405,20 @@ class ROIHeads(torch.nn.Module):
 
             num_bg_samples.append((gt_classes == self.num_classes).sum().item())
             num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])
+            
+            
+            if gt_flag:
+                unk_sel_gt.append(unk_instances_gt.gt_boxes)
+            else:
+                unk_gt_boxes = []
+                unk_sel_gt.append(unk_gt_boxes)
             proposals_with_gt.append(proposals_per_image)
 
         # Log the number of fg/bg samples that are selected for training ROI heads
-        storage = get_event_storage()
+        # storage = get_event_storage()
         storage.put_scalar("roi_head/num_fg_samples", np.mean(num_fg_samples))
         storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
-
-        return proposals_with_gt
+        return proposals_with_gt, unk_sel_gt
 
     def forward(
         self,
@@ -455,7 +543,7 @@ class Res5ROIHeads(ROIHeads):
         location = os.path.join(self.energy_save_path, shortuuid.uuid() + '.pkl')
         torch.save(data, location)
 
-    def forward(self, images, features, proposals, targets=None):
+    def forward(self, images, features, proposals, targets=None, image_id=None, ori_image=None):
         """
         See :meth:`ROIHeads.forward`.
         """
@@ -463,7 +551,7 @@ class Res5ROIHeads(ROIHeads):
 
         if self.training:
             assert targets
-            proposals = self.label_and_sample_proposals(proposals, targets)
+            proposals, unk_sel_gt = self.label_and_sample_proposals(proposals, targets, image_id, ori_image)
         del targets
 
         proposal_boxes = [x.proposal_boxes for x in proposals]
@@ -471,19 +559,13 @@ class Res5ROIHeads(ROIHeads):
             [features[f] for f in self.in_features], proposal_boxes
         )
         input_features = box_features.mean(dim=[2, 3])
-        if self.training:
-            # self.log_features(input_features, proposals)
-            if self.enable_clustering:
-                # print("11111111111111112222222222222222222")
-                self.box_predictor.update_feature_store(input_features, proposals)
-                self.box_predictor.updatePrototype()
         predictions = self.box_predictor(input_features)
 
         if self.training:
             # self.log_features(input_features, proposals)
-            # if self.enable_clustering:
-            #     self.box_predictor.update_feature_store(input_features, proposals)
-            # del features
+            if self.enable_clustering:
+                self.box_predictor.update_feature_store(input_features, proposals)
+            del features
             if self.compute_energy_flag:
                 self.compute_energy(predictions, proposals)
             losses = self.box_predictor.losses(predictions, proposals, input_features)
@@ -498,11 +580,11 @@ class Res5ROIHeads(ROIHeads):
                 mask_features = box_features[torch.cat(fg_selection_masks, dim=0)]
                 del box_features
                 losses.update(self.mask_head(mask_features, proposals))
-            return [], losses
+            return [], losses, unk_sel_gt
         else:
             pred_instances, _ = self.box_predictor.inference(predictions, proposals)
             pred_instances = self.forward_with_given_boxes(features, pred_instances)
-            return pred_instances, {}
+            return pred_instances, {}, []
 
     def forward_with_given_boxes(self, features, instances):
         """
